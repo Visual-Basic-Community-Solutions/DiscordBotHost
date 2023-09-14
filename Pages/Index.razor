@@ -1,0 +1,160 @@
+﻿@page "/"
+
+@inject ILogger<Index> Logger;
+@inject IServiceProvider Provider;
+
+@inject DisqordBot Bot;
+@inject LoggingService LogStream;
+@inject ResourceService Resources;
+@inject DiscordClientRunnerService ClientService
+@inject DiscordBotSetupService BotService
+
+<MudStack AlignItems="AlignItems.Center" Justify="Justify.Center">
+    <MudPaper Class="mx-auto my-8 py-16" Elevation="3" Height="60vh" Width="80vw">
+        <MudStack AlignItems="AlignItems.Center" Justify="Justify.Center" Spacing="4">
+            <MudText Typo="Typo.h6" Inline="true">@_title</MudText>
+            <MudIcon Icon="@State.Icon" Style="width:175px; height:175px;" />
+            <MudButton Disabled="@(State.Status == Status.Connecting)" OnClick="ToggleConnectionState" Variant="Variant.Filled" Color="@State.Color">
+                @if (State.Status == Status.Connecting)
+                {
+                    <MudProgressCircular Class="mx-n1" Size="Size.Small" Indeterminate="true" />
+                }
+                <MudText Class="ma-2">@State.Message</MudText>
+            </MudButton>
+            @if (_inError)
+            {
+                <MudPaper Class="pa-4 overflow-scroll" Height="110px" MaxWidth="80vw" Outlined="true" Elevation="0">
+                    <MudText Typo="Typo.caption" Style="font-weight:700;" Inline="false">Logs</MudText><br/>
+                    @foreach (var log in _logs)
+                    {
+                        <MudText Typo="Typo.caption" Inline="false">
+                            <MudHighlighter Markup="true" Text="@log" />
+                        </MudText><br/>
+                    }
+                </MudPaper>
+            }
+        </MudStack>
+    </MudPaper>
+    @if (_ramUsage > 0)
+    {
+        <MudProgressLinear Color="Color.Primary" Rounded="true" Size="Size.Small" Value="@_ramUsage" />
+        <MudText Typo="Typo.caption">@($"{Math.Round(_ramUsage, 2)}%")</MudText>
+    }
+</MudStack>
+
+@code {
+    private record struct ConnectionState(Status Status, string Message, Color Color, string Icon);
+
+    private enum Status { Offline, Connecting, Online };
+
+    private ConnectionState State { get; set; } = Offline;
+
+    private bool _inError;
+    private string _title;
+    private double _ramUsage;
+    private Task _streamingTask;
+    private List<string> _logs = new();
+
+    private static ConnectionState Offline = new(Status.Offline, "Connect", Color.Success, Icons.Material.Filled.WifiOff);
+    private static ConnectionState Online = new(Status.Online, "Disconnect", Color.Error, Icons.Material.Filled.Wifi);
+    private static ConnectionState Connecting = new(Status.Connecting, "Connecting", Color.Primary, Icons.Material.Outlined.WifiFind);
+    private static ConnectionState Disconnecting = new(Status.Connecting, "Disconnecting", Color.Primary, Icons.Material.Filled.WifiLock);
+
+
+    protected override async Task OnInitializedAsync()
+    {
+        Bot.Ready += BotReady;
+
+        _title = "Offline";
+
+        _streamingTask = Task.Run(async () =>
+        {
+            while (await LogStream.Reader.WaitToReadAsync(Bot.StoppingToken))
+            {
+                while (LogStream.Reader.TryRead(out var message))
+                {
+                    _logs.Insert(0, message);
+                    _logs = _logs.Take(10).ToList();
+
+                    if (!_inError && message.StartsWith("<strong>Error"))
+                    {
+                        _inError = true;
+
+                        if (State.Status == Status.Connecting) await ToggleConnectionState();
+                    } 
+
+                    await InvokeAsync(StateHasChanged);
+                }
+            }
+        }, 
+        Bot.StoppingToken);
+
+        await base.OnInitializedAsync();
+    }
+
+    public async Task RamUsageAsync()
+    {
+        while (State.Status == Status.Online)
+        {
+            _ramUsage = Resources.GetMemoryUsage();
+
+            Logger.LogInformation($"Ram Usage: {_ramUsage}%");
+
+            await InvokeAsync(StateHasChanged);
+
+            if (_ramUsage > 100) _ramUsage = 0;
+
+            await Task.Delay(500);
+        }
+
+        _ramUsage = 0;
+        await InvokeAsync(StateHasChanged);
+    }
+
+    private async Task BotReady(object sender, ReadyEventArgs args)
+    {
+        State = Online;
+
+        _ = RamUsageAsync();
+
+        Bot.Ready -= BotReady;
+
+        _title = $"Connected: {Bot.CurrentUser.Name}";
+
+        await InvokeAsync(StateHasChanged);
+
+        Logger.LogInformation("Bot connected successfully!");
+    }
+
+    private async Task ToggleConnectionState()
+    {
+        switch (State.Status)
+        {
+            case Status.Offline:
+                Logger.LogInformation("Initializing bot connection...");
+
+                State = Connecting;
+
+                await BotService.StartAsync(Bot.StoppingToken);
+                await ClientService.StartAsync(Bot.StoppingToken);
+                break;
+            case Status.Connecting:
+            case Status.Online:
+                Logger.LogInformation("Stopping bot connection...");
+
+                State = Disconnecting;
+
+                await BotService.StopAsync(Bot.StoppingToken);
+                await ClientService.StopAsync(Bot.StoppingToken);
+
+                await Task.Delay(2000);
+
+                State = Offline;
+
+                if (!_inError) Application.Current.Quit();
+                
+                break;
+            default: break;
+        }
+    }
+}
